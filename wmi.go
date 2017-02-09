@@ -99,6 +99,11 @@ type Client struct {
 	// Setting this to true allows custom queries to be used with full
 	// struct definitions instead of having to define multiple structs.
 	AllowMissingFields bool
+
+	// SWbemServiceClient is an optional SWbemServices object that can be
+	// initialized and then reused across multiple queries. If it is null
+	// then the method will initialize a new temporary client each time.
+	SWbemServicesClient SWbemServices
 }
 
 // DefaultClient is the default Client and is used by Query, QueryNamespace
