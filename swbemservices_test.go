@@ -41,10 +41,11 @@ func TestWbemQuery(t *testing.T) {
 	//}
 	errClose := s.Close()
 	if errClose != nil {
-		t.Fatalf("Close: %s", err)
+		t.Fatalf("Close: %s", errClose)
 	}
 }
 
+// Run using: go test -run TestWbemMemory -timeout 60m
 func TestWbemMemory(t *testing.T) {
 	s, err := InitializeSWbemServices(DefaultClient)
 	if err != nil {

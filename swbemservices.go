@@ -16,50 +16,138 @@ type SWbemServices struct {
 	cWMIClient            *Client //This could also be an embedded struct, but then we would need to branch on Client vs SWbemServices in the Query method
 	sWbemLocatorIUnknown  *ole.IUnknown
 	sWbemLocatorIDispatch *ole.IDispatch
+	queries               chan *queryRequest
+	closeError            chan error
+}
+
+type queryRequest struct {
+	query    string
+	dst      interface{}
+	args     interface{}
+	finished chan error
 }
 
 // InitializeSWbemServices will return a new SWbemServices object that can be used to query WMI
 func InitializeSWbemServices(c *Client, connectServerArgs ...interface{}) (*SWbemServices, error) {
+	fmt.Println("InitializeSWbemServices: Starting")
 	s := new(SWbemServices)
 	s.cWMIClient = c
+	s.queries = make(chan *queryRequest)
+	initError := make(chan error)
+	go s.process(initError)
 
-	//Do we need to force SWbemServices to run on a different thread prior to locking?
-	runtime.LockOSThread()
-
-	err := ole.CoInitializeEx(0, ole.COINIT_MULTITHREADED)
-	if err != nil {
-		oleCode := err.(*ole.OleError).Code()
-		if oleCode != ole.S_OK && oleCode != S_FALSE {
-			return nil, err
+WaitForProcessSignal:
+	for {
+		select {
+		case err, ok := <-initError:
+			if ok {
+				return nil, err //Send error to caller
+			}
+			break WaitForProcessSignal
+		default:
+			//Wait for process method to return an error or signal it is ready (by closing channel)
 		}
 	}
-
-	unknown, err := oleutil.CreateObject("WbemScripting.SWbemLocator")
-	if err != nil {
-		return nil, err
-	} else if unknown == nil {
-		return nil, ErrNilCreateObject
-	}
-	s.sWbemLocatorIUnknown = unknown
-
-	dispatch, err := s.sWbemLocatorIUnknown.QueryInterface(ole.IID_IDispatch)
-	if err != nil {
-		return nil, err
-	}
-	s.sWbemLocatorIDispatch = dispatch
-
-	// we can't do the ConnectServer call here unless we find a way to track and re-init the connectServerArgs
-
+	fmt.Println("InitializeSWbemServices: Finished")
 	return s, nil
 }
 
 // Close will clear and release all of the SWbemServices resources
 func (s *SWbemServices) Close() error {
+	fmt.Println("Close: sending close request")
+	var result error
+	ce := make(chan error)
+	s.closeError = ce //Race condition if multiple callers to close. May need to lock here
+	close(s.queries)  //Tell background to shut things down
+WaitForClosedSignal:
+	for {
+		select {
+		case err, ok := <-ce:
+			if ok {
+				result = err
+			}
+			break WaitForClosedSignal
+		default:
+			//Wait for close method to return an error or signal it is finished by closing channel
+		}
+	}
+	fmt.Println("Close: finished")
+	return result
+}
+
+// This method will be called on the background thread and must clean up all WMI/OLE and chan resources
+func (s *SWbemServices) closeBackground() error {
+	//TODO: detect errors and return them to the caller somehow? The caller could be InitializeSWbemServices, Query, or Close
+	fmt.Println("closeBackground: Starting")
+	s.queries = nil //set channel to nil so we know it is closed
 	s.sWbemLocatorIDispatch.Release()
 	s.sWbemLocatorIUnknown.Release()
 	ole.CoUninitialize()
 	runtime.UnlockOSThread()
+	fmt.Println("closeBackground: Finished")
 	return nil
+}
+
+func (s *SWbemServices) process(initError chan error) {
+	fmt.Println("process: starting background thread initialization")
+	//All OLE/WMI calls must happen on the same initialized thead, so lock this goroutine
+	runtime.LockOSThread()
+	//defer s.closeBackground() //Does this run on the same locked thread? Can't rely on s.closing as select hasn't started yet
+
+	err := ole.CoInitializeEx(0, ole.COINIT_MULTITHREADED)
+	if err != nil {
+		oleCode := err.(*ole.OleError).Code()
+		if oleCode != ole.S_OK && oleCode != S_FALSE {
+			initError <- fmt.Errorf("ole.CoInitializeEx error: %v", err)
+			return
+		}
+	}
+
+	unknown, err := oleutil.CreateObject("WbemScripting.SWbemLocator")
+	if err != nil {
+		initError <- fmt.Errorf("CreateObject SWbemLocator error: %v", err)
+		return
+	} else if unknown == nil {
+		initError <- ErrNilCreateObject
+		return
+	}
+	s.sWbemLocatorIUnknown = unknown
+
+	dispatch, err := s.sWbemLocatorIUnknown.QueryInterface(ole.IID_IDispatch)
+	if err != nil {
+		initError <- fmt.Errorf("SWbemLocator QueryInterface error: %v", err)
+		return
+	}
+	s.sWbemLocatorIDispatch = dispatch
+
+	// we can't do the ConnectServer call outside the loop unless we find a way to track and re-init the connectServerArgs
+	fmt.Println("process: initialized. closing initError")
+	close(initError)
+	fmt.Println("process: waiting for queries")
+	for {
+		select {
+		case q, ok := <-s.queries:
+			if ok {
+				fmt.Printf("process: new query: len(query)=%d\n", len(q.query))
+				errQuery := s.queryBackground(q)
+				fmt.Println("process: s.queryBackground finished")
+				if errQuery != nil {
+					q.finished <- errQuery
+				}
+				close(q.finished)
+			} else {
+				fmt.Println("process: queries channel closed")
+				errClose := s.closeBackground()
+				if errClose == nil && s.closeError != nil {
+					s.closeError <- errClose
+				}
+				if s.closeError != nil {
+					close(s.closeError)
+				}
+			}
+		default:
+		}
+	}
 }
 
 // Query runs the WQL query and appends the values to dst.
@@ -73,12 +161,47 @@ func (s *SWbemServices) Close() error {
 // changed using connectServerArgs. See
 // http://msdn.microsoft.com/en-us/library/aa393720.aspx for details.
 func (s *SWbemServices) Query(query string, dst interface{}, connectServerArgs ...interface{}) error {
-	if s.sWbemLocatorIDispatch == nil {
+	if s == nil || s.sWbemLocatorIDispatch == nil {
+		return fmt.Errorf("SWbemServices is not Initialized")
+	}
+	if s.queries == nil {
+		return fmt.Errorf("SWbemServices has been closed")
+	}
+
+	fmt.Println("Query: Sending query request")
+	qr := queryRequest{
+		query:    query,
+		dst:      dst,
+		args:     connectServerArgs,
+		finished: make(chan error),
+	}
+	s.queries <- &qr
+
+WaitForFinishedSignal:
+	for {
+		select {
+		case err, ok := <-qr.finished:
+			if ok {
+				fmt.Println("Query: Finished with error")
+				return err //Send error to caller
+			}
+			break WaitForFinishedSignal
+		default:
+			//Wait for query to return an error or signal it is finished by closing the channel
+		}
+	}
+	fmt.Println("Query: Finished")
+	return nil
+}
+
+func (s *SWbemServices) queryBackground(q *queryRequest) error {
+	if s == nil || s.sWbemLocatorIDispatch == nil {
 		return fmt.Errorf("SWbemServices is not Initialized")
 	}
 	wmi := s.sWbemLocatorIDispatch //Should just rename in the code, but this will help as we break things apart
+	fmt.Println("queryBackground: Starting")
 
-	dv := reflect.ValueOf(dst)
+	dv := reflect.ValueOf(q.dst)
 	if dv.Kind() != reflect.Ptr || dv.IsNil() {
 		return ErrInvalidEntityType
 	}
@@ -89,7 +212,7 @@ func (s *SWbemServices) Query(query string, dst interface{}, connectServerArgs .
 	}
 
 	// service is a SWbemServices
-	serviceRaw, err := oleutil.CallMethod(wmi, "ConnectServer", connectServerArgs...)
+	serviceRaw, err := oleutil.CallMethod(wmi, "ConnectServer", nil) // todo: use q.args...)
 	if err != nil {
 		return err
 	}
@@ -97,7 +220,7 @@ func (s *SWbemServices) Query(query string, dst interface{}, connectServerArgs .
 	defer serviceRaw.Clear()
 
 	// result is a SWBemObjectSet
-	resultRaw, err := oleutil.CallMethod(service, "ExecQuery", query)
+	resultRaw, err := oleutil.CallMethod(service, "ExecQuery", q.query)
 	if err != nil {
 		return err
 	}
@@ -159,5 +282,6 @@ func (s *SWbemServices) Query(query string, dst interface{}, connectServerArgs .
 			return err
 		}
 	}
+	fmt.Println("queryBackground: Finished")
 	return errFieldMismatch
 }
